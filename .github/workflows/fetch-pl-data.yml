@@ -14,6 +14,10 @@ on:
         description: "Last season (inclusive)"
         required: true
         default: "2023"
+      probe:
+        description: "Tick to only TEST which seasons your plan allows (uses about 1 request per season, downloads nothing)"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -33,7 +37,13 @@ jobs:
           API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY }}
           FROM: ${{ inputs.from }}
           TO: ${{ inputs.to }}
-        run: node tools/fetch-pl-data.mjs --from "$FROM" --to "$TO" --out data/pl
+          PROBE: ${{ inputs.probe }}
+        run: |
+          if [ "$PROBE" = "true" ]; then
+            node tools/fetch-pl-data.mjs --from "$FROM" --to "$TO" --out data/pl --probe
+          else
+            node tools/fetch-pl-data.mjs --from "$FROM" --to "$TO" --out data/pl
+          fi
 
       - name: Commit data
         env:
@@ -42,6 +52,6 @@ jobs:
         run: |
           git config user.name "data-bot"
           git config user.email "data-bot@users.noreply.github.com"
-          git add data/pl/*.json
+          git add data/pl/*.json || true
           git diff --cached --quiet || git commit -m "Add Premier League data $FROM-$TO"
           git push
