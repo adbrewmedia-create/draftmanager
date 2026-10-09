@@ -4,6 +4,9 @@
  *
  *   API_FOOTBALL_KEY=your-key node tools/fetch-pl-data.mjs --from 2023 --to 2023
  *
+ * Works on the free plan: it asks for one club at a time (about 2 pages each), because the free plan
+ * only allows pages 1-3 of any list. Roughly 40 requests per season.
+ *
  * Needs Node 18+ (built-in fetch). The key is read from the environment, never written to a file.
  *
  * Options
@@ -38,8 +41,13 @@ const FORCE = !!args.force;
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 let remaining = null, lastCall = 0;
+const notes = [];            // why a season was not downloaded
+let wrote = 0, already = 0;
+
+class QuotaStop extends Error {}
 
 async function api(endpoint, params = {}) {
+  if (remaining !== null && remaining <= RESERVE) throw new QuotaStop('daily request limit nearly used');
   const wait = DELAY - (Date.now() - lastCall);
   if (wait > 0) await sleep(wait);
   lastCall = Date.now();
@@ -71,11 +79,19 @@ function gameRating(apiRating, minutes) {
 async function exists(f) { try { await fs.access(f); return true; } catch { return false; } }
 async function readJson(f) { return JSON.parse(await fs.readFile(f, 'utf8')); }
 
+/** cached GET: a page already saved on disk costs no request */
+async function cached(file, endpoint, params) {
+  if (await exists(file)) return readJson(file);
+  const json = await api(endpoint, params);
+  await fs.writeFile(file, JSON.stringify(json));
+  return json;
+}
+
 async function main() {
   await fs.mkdir(path.join(OUT, '.cache'), { recursive: true });
 
-  // 1) which seasons exist and have player data (one request)
-  let coverage = {};
+  // 1) which seasons have player data (one request)
+  const coverage = {};
   try {
     const lg = await api('/leagues', { id: LEAGUE });
     for (const s of (lg.response?.[0]?.seasons || [])) coverage[s.year] = !!s.coverage?.players;
@@ -84,68 +100,76 @@ async function main() {
 
   for (let season = FROM; season <= TO; season++) {
     const outFile = path.join(OUT, `${season}.json`);
-    if (!FORCE && await exists(outFile)) { console.log(`${season}: already downloaded, skipping`); continue; }
-    if (coverage[season] === false) { console.log(`${season}: the API lists no player data for this season, skipping`); continue; }
+    if (!FORCE && await exists(outFile)) { console.log(`${season}: already downloaded, skipping`); already++; continue; }
+    if (coverage[season] === false) { const m = `${season}: the API lists no player data for this season`; console.log(m + ', skipping'); notes.push(m); continue; }
 
-    console.log(`${season}/${String(season + 1).slice(-2)}: downloading players...`);
-    const rows = [];
-    let page = 1, total = 1, stopped = false;
+    console.log(`${season}/${String(season + 1).slice(-2)}: downloading clubs and players...`);
+    const teams = [];
     try {
-      while (page <= total) {
-        const cache = path.join(OUT, '.cache', `${season}-p${page}.json`);
-        let json;
-        if (await exists(cache)) json = await readJson(cache);
-        else {
-          if (remaining !== null && remaining <= RESERVE) { stopped = true; break; }
-          json = await api('/players', { league: LEAGUE, season, page });
-          await fs.writeFile(cache, JSON.stringify(json));
+      // 2) the clubs in that season (one request)
+      const tj = await cached(path.join(OUT, '.cache', `${season}-teams.json`), '/teams', { league: LEAGUE, season });
+      const clubs = (tj.response || []).map(r => ({ id: r.team.id, name: r.team.name }));
+      if (!clubs.length) throw new Error('the API returned no clubs for this season');
+      console.log(`  ${clubs.length} clubs`);
+
+      // 3) each club's players, 20 per page (a club fits in 1-2 pages, inside the free plan's limit of 3)
+      for (const club of clubs) {
+        const players = [];
+        let page = 1, total = 1;
+        while (page <= total) {
+          const json = await cached(path.join(OUT, '.cache', `${season}-t${club.id}-p${page}.json`), '/players', { team: club.id, league: LEAGUE, season, page });
+          total = json.paging?.total || 1;
+          for (const r of (json.response || [])) {
+            for (const st of (r.statistics || [])) {
+              if (st.league?.id !== LEAGUE || st.team?.id !== club.id) continue;
+              const pos = mapPos(st.games?.position);
+              if (!pos) continue;
+              const minutes = st.games?.minutes || 0;
+              players.push({
+                id: r.player.id,
+                name: r.player.name,
+                nat: r.player.nationality,
+                age: r.player.age,
+                pos,
+                apps: st.games?.appearences || 0,       // (sic) the API spells it this way
+                minutes,
+                apiRating: st.games?.rating ? +parseFloat(st.games.rating).toFixed(2) : null,
+                goals: st.goals?.total || 0,
+                assists: st.goals?.assists || 0,
+                rating: gameRating(st.games?.rating, minutes)
+              });
+            }
+          }
+          page++;
         }
-        total = json.paging?.total || 1;
-        rows.push(...(json.response || []));
-        process.stdout.write(`  page ${page}/${total}  (requests left today: ${remaining ?? 'unknown'})\r`);
-        page++;
+        teams.push({ id: club.id, name: club.name, players: players.sort((a, b) => b.minutes - a.minutes) });
+        process.stdout.write(`  ${club.name}: ${players.length} players  (requests left today: ${remaining ?? 'unknown'})\n`);
       }
     } catch (e) {
+      if (e instanceof QuotaStop) {
+        notes.push(`${season}: stopped because the daily request limit is nearly used (re-run tomorrow; fetched pages are cached)`);
+        console.log(`\nStopped: daily request limit nearly used. Re-run tomorrow to finish ${season}; pages already fetched are cached.`);
+        break;
+      }
       console.log(`\n${season}: ${e.message}`);
-      if (e.apiErrors?.plan) console.log('  -> your plan does not include this season; try other seasons.');
+      notes.push(`${season}: ${e.message}`);
+      if (/season/i.test(e.message) && e.apiErrors?.plan) console.log('  -> your plan does not include this season; try other seasons.');
       continue;
     }
-    if (stopped) { console.log(`\nStopped: daily request limit nearly used. Re-run tomorrow to finish ${season}; pages already fetched are cached.`); break; }
 
-    // 2) group by club (a player who moved mid-season has stats for each club)
-    const clubs = new Map();
-    for (const r of rows) {
-      for (const st of (r.statistics || [])) {
-        if (st.league?.id !== LEAGUE) continue;
-        const pos = mapPos(st.games?.position);
-        if (!pos) continue;
-        const id = st.team.id;
-        if (!clubs.has(id)) clubs.set(id, { id, name: st.team.name, players: [] });
-        const minutes = st.games?.minutes || 0;
-        clubs.get(id).players.push({
-          id: r.player.id,
-          name: r.player.name,
-          nat: r.player.nationality,
-          age: r.player.age,
-          pos,
-          apps: st.games?.appearences || 0,       // (sic) the API spells it this way
-          minutes,
-          apiRating: st.games?.rating ? +parseFloat(st.games.rating).toFixed(2) : null,
-          goals: st.goals?.total || 0,
-          assists: st.goals?.assists || 0,
-          rating: gameRating(st.games?.rating, minutes)
-        });
-      }
-    }
-    const teams = [...clubs.values()]
-      .map(c => ({ ...c, players: c.players.sort((a, b) => b.minutes - a.minutes) }))
-      .sort((a, b) => a.name.localeCompare(b.name));
-
+    teams.sort((a, b) => a.name.localeCompare(b.name));
     await fs.writeFile(outFile, JSON.stringify({ season, league: LEAGUE, fetchedAt: new Date().toISOString(), teams }, null, 1));
-    console.log(`\n${season}: wrote ${outFile}  (${teams.length} clubs, ${teams.reduce((n, t) => n + t.players.length, 0)} player entries)`);
+    wrote++;
+    console.log(`${season}: wrote ${outFile}  (${teams.length} clubs, ${teams.reduce((n, t) => n + t.players.length, 0)} player entries)`);
   }
 
-  // 3) small index so the game knows which seasons have real data
+  if (!wrote && !already) {
+    console.error('\nNo season files were written, so nothing will be committed. Reasons:');
+    (notes.length ? notes : ['(no error was reported; check the key and the season range)']).forEach(n => console.error('  - ' + n));
+    process.exit(2);
+  }
+
+  // 4) small index so the game knows which seasons have real data
   const files = (await fs.readdir(OUT)).filter(f => /^\d{4}\.json$/.test(f)).sort();
   const index = [];
   for (const f of files) { const j = await readJson(path.join(OUT, f)); index.push({ season: j.season, clubs: j.teams.length }); }
