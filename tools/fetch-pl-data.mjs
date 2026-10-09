@@ -16,6 +16,7 @@
  *   --delay 6500     milliseconds between requests (stay under the per-minute limit)
  *   --reserve 3      stop cleanly when this many daily requests are left
  *   --force          re-download seasons that already have a file
+ *   --probe          only test which seasons your plan allows (about 1 request each), download nothing
  *
  * Safe to stop and re-run: pages are cached under <out>/.cache, finished seasons are skipped.
  */
@@ -38,6 +39,7 @@ const OUT = args.out || 'data/pl';
 const DELAY = +(args.delay || 6500);
 const RESERVE = +(args.reserve || 3);
 const FORCE = !!args.force;
+const PROBE = !!args.probe;
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 let remaining = null, lastCall = 0;
@@ -65,6 +67,7 @@ async function api(endpoint, params = {}) {
   return json;
 }
 
+const clean = x => String(x || '').replace(/&apos;|&#39;/g, "'").replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/\s+/g, ' ').trim();
 const mapPos = p => ({ Goalkeeper: 'GK', Defender: 'DEF', Midfielder: 'MID', Attacker: 'FWD' })[p] || null;
 
 /** API average match rating (about 6.0 to 8.0) -> game rating 54..94, pulled toward average for small samples */
@@ -98,6 +101,23 @@ async function main() {
     console.log(`Plan check: ${remaining ?? '?'} requests left today.`);
   } catch (e) { console.warn('Could not read league coverage (continuing):', e.message); }
 
+  if (PROBE) {
+    const have = Object.entries(coverage).filter(([, v]) => v).map(([y]) => +y).sort((a, b) => a - b);
+    if (have.length) console.log(`The API lists player data for ${have[0]} to ${have[have.length - 1]} (${have.length} seasons).`);
+    const ok = [], blocked = [];
+    for (let season = FROM; season <= TO; season++) {
+      try { await api('/teams', { league: LEAGUE, season }); ok.push(season); console.log(`${season}/${String(season + 1).slice(-2)}: allowed on your plan`); }
+      catch (e) {
+        if (e instanceof QuotaStop) { console.log('Stopped: daily request limit nearly used.'); break; }
+        blocked.push(season); console.log(`${season}/${String(season + 1).slice(-2)}: NOT available (${e.message})`);
+      }
+    }
+    console.log(`\nAllowed: ${ok.length ? ok.join(', ') : 'none'}`);
+    console.log(`Not allowed: ${blocked.length ? blocked.join(', ') : 'none'}`);
+    console.log(`Requests left today: ${remaining ?? 'unknown'}.`);
+    return;
+  }
+
   for (let season = FROM; season <= TO; season++) {
     const outFile = path.join(OUT, `${season}.json`);
     if (!FORCE && await exists(outFile)) { console.log(`${season}: already downloaded, skipping`); already++; continue; }
@@ -127,7 +147,7 @@ async function main() {
               const minutes = st.games?.minutes || 0;
               players.push({
                 id: r.player.id,
-                name: r.player.name,
+                name: clean(r.player.name),
                 nat: r.player.nationality,
                 age: r.player.age,
                 pos,
@@ -142,7 +162,9 @@ async function main() {
           }
           page++;
         }
-        teams.push({ id: club.id, name: club.name, players: players.sort((a, b) => b.minutes - a.minutes) });
+        // squad fillers who never played add nothing to the game and double the file size
+        const played = players.filter(p => p.minutes > 0);
+        teams.push({ id: club.id, name: club.name, players: played.sort((a, b) => b.minutes - a.minutes) });
         process.stdout.write(`  ${club.name}: ${players.length} players  (requests left today: ${remaining ?? 'unknown'})\n`);
       }
     } catch (e) {
@@ -158,7 +180,7 @@ async function main() {
     }
 
     teams.sort((a, b) => a.name.localeCompare(b.name));
-    await fs.writeFile(outFile, JSON.stringify({ season, league: LEAGUE, fetchedAt: new Date().toISOString(), teams }, null, 1));
+    await fs.writeFile(outFile, JSON.stringify({ season, league: LEAGUE, fetchedAt: new Date().toISOString(), teams }));
     wrote++;
     console.log(`${season}: wrote ${outFile}  (${teams.length} clubs, ${teams.reduce((n, t) => n + t.players.length, 0)} player entries)`);
   }
